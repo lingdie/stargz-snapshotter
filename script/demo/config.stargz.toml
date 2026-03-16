@@ -9,3 +9,9 @@ insecure = true
 direct = true
 [snapshotter]
 allow_invalid_mounts_on_restart = true
+
+# Uncomment to enable devbox-style LVM-backed writable layers.
+# [snapshotter.devbox]
+# enable = true
+# lvm_vg_name = "devbox-lvm-vg"
+# thin_pool_name = "devbox-thinpool"

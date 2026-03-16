@@ -70,4 +70,17 @@ type SnapshotterConfig struct {
 	// NOTE: User needs to manually remove the snapshots from containerd's metadata store using
 	//       ctr (e.g. `ctr snapshot rm`).
 	AllowInvalidMountsOnRestart bool `toml:"allow_invalid_mounts_on_restart" json:"allow_invalid_mounts_on_restart"`
+
+	// Devbox is configuration for devbox-style LVM-backed writable layers.
+	Devbox DevboxConfig `toml:"devbox" json:"devbox"`
+}
+
+type DevboxConfig struct {
+	Enable bool `toml:"enable" json:"enable"`
+
+	// VolumeGroup is the LVM volume group used for devbox writable layers.
+	VolumeGroup string `toml:"lvm_vg_name" json:"lvm_vg_name"`
+
+	// ThinPoolName optionally enables thin provisioning via the specified thin pool.
+	ThinPoolName string `toml:"thin_pool_name" json:"thin_pool_name"`
 }

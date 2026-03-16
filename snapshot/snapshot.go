@@ -31,6 +31,7 @@ import (
 	"github.com/containerd/continuity/fs"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
+	"github.com/containerd/stargz-snapshotter/snapshot/devbox"
 	"github.com/moby/sys/mountinfo"
 	"golang.org/x/sync/errgroup"
 )
@@ -73,6 +74,7 @@ type SnapshotterConfig struct {
 	asyncRemove                 bool
 	noRestore                   bool
 	allowInvalidMountsOnRestart bool
+	devbox                      *devbox.Controller
 }
 
 // Opt is an option to configure the remote snapshotter
@@ -97,6 +99,13 @@ func AllowInvalidMountsOnRestart(config *SnapshotterConfig) error {
 	return nil
 }
 
+func WithDevboxController(controller *devbox.Controller) Opt {
+	return func(config *SnapshotterConfig) error {
+		config.devbox = controller
+		return nil
+	}
+}
+
 type snapshotter struct {
 	root        string
 	ms          *storage.MetaStore
@@ -107,6 +116,7 @@ type snapshotter struct {
 	userxattr                   bool // whether to enable "userxattr" mount option
 	noRestore                   bool
 	allowInvalidMountsOnRestart bool
+	devbox                      *devbox.Controller
 }
 
 // NewSnapshotter returns a Snapshotter which can use unpacked remote layers
@@ -157,6 +167,7 @@ func NewSnapshotter(ctx context.Context, root string, targetFs FileSystem, opts 
 		userxattr:                   userxattr,
 		noRestore:                   config.noRestore,
 		allowInvalidMountsOnRestart: config.allowInvalidMountsOnRestart,
+		devbox:                      config.devbox,
 	}
 
 	if err := o.restoreRemoteSnapshot(ctx); err != nil {
@@ -186,6 +197,16 @@ func (o *snapshotter) Stat(ctx context.Context, key string) (snapshots.Info, err
 }
 
 func (o *snapshotter) Update(ctx context.Context, info snapshots.Info, fieldpaths ...string) (snapshots.Info, error) {
+	if o.devbox != nil {
+		handled, err := o.devbox.HandleUpdate(ctx, info.Name, info.Labels)
+		if err != nil {
+			return snapshots.Info{}, err
+		}
+		if handled {
+			return o.Stat(ctx, info.Name)
+		}
+	}
+
 	ctx, t, err := o.ms.TransactionContext(ctx, true)
 	if err != nil {
 		return snapshots.Info{}, err
@@ -343,7 +364,16 @@ func (o *snapshotter) commit(ctx context.Context, isRemote bool, name, key strin
 	}
 
 	rollback = false
-	return t.Commit()
+	if err := t.Commit(); err != nil {
+		return err
+	}
+	if o.devbox != nil {
+		if err := o.devbox.RenameSnapshot(ctx, key, name); err != nil {
+			log.G(ctx).WithError(err).WithField("from", key).WithField("to", name).
+				Warn("failed to update devbox snapshot metadata during commit")
+		}
+	}
+	return nil
 }
 
 // Remove abandons the snapshot identified by key. The snapshot will
@@ -354,6 +384,7 @@ func (o *snapshotter) Remove(ctx context.Context, key string) (err error) {
 	if err != nil {
 		return err
 	}
+	var removals []string
 	defer func() {
 		if err != nil {
 			if rerr := t.Rollback(); rerr != nil {
@@ -368,29 +399,34 @@ func (o *snapshotter) Remove(ctx context.Context, key string) (err error) {
 	}
 
 	if !o.asyncRemove {
-		var removals []string
 		const cleanupCommitted = false
 		removals, err = o.getCleanupDirectories(ctx, t, cleanupCommitted)
 		if err != nil {
 			return fmt.Errorf("unable to get directories for removal: %w", err)
 		}
-
-		// Remove directories after the transaction is closed, failures must not
-		// return error since the transaction is committed with the removal
-		// key no longer available.
-		defer func() {
-			if err == nil {
-				for _, dir := range removals {
-					if err := o.cleanupSnapshotDirectory(ctx, dir); err != nil {
-						log.G(ctx).WithError(err).WithField("path", dir).Warn("failed to remove directory")
-					}
-				}
-			}
-		}()
-
 	}
 
-	return t.Commit()
+	if err := t.Commit(); err != nil {
+		return err
+	}
+	if o.devbox != nil {
+		if err := o.devbox.RemoveSnapshot(ctx, key); err != nil {
+			log.G(ctx).WithError(err).WithField("key", key).Warn("failed to update devbox snapshot metadata during remove")
+		}
+	}
+	if !o.asyncRemove {
+		for _, dir := range removals {
+			if err := o.cleanupSnapshotDirectory(ctx, dir); err != nil {
+				log.G(ctx).WithError(err).WithField("path", dir).Warn("failed to remove directory")
+			}
+		}
+		if o.devbox != nil {
+			if err := o.devbox.Cleanup(ctx); err != nil {
+				log.G(ctx).WithError(err).Warn("failed to cleanup devbox volumes")
+			}
+		}
+	}
+	return nil
 }
 
 // Walk the snapshots.
@@ -419,6 +455,11 @@ func (o *snapshotter) cleanup(ctx context.Context, cleanupCommitted bool) error 
 	for _, dir := range cleanup {
 		if err := o.cleanupSnapshotDirectory(ctx, dir); err != nil {
 			log.G(ctx).WithError(err).WithField("path", dir).Warn("failed to remove directory")
+		}
+	}
+	if o.devbox != nil {
+		if err := o.devbox.Cleanup(ctx); err != nil {
+			return err
 		}
 	}
 
@@ -492,6 +533,11 @@ func (o *snapshotter) getCleanupDirectories(ctx context.Context, t storage.Trans
 }
 
 func (o *snapshotter) cleanupSnapshotDirectory(ctx context.Context, dir string) error {
+	if o.devbox != nil {
+		if err := o.devbox.CleanupSnapshotDirectory(ctx, dir); err != nil {
+			return err
+		}
+	}
 
 	// On a remote snapshot, the layer is mounted on the "fs" directory.
 	// We use Filesystem's Unmount API so that it can do necessary finalization
@@ -512,9 +558,19 @@ func (o *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 		return storage.Snapshot{}, err
 	}
 
-	var td, path string
+	var (
+		td, path        string
+		prepared        *devbox.PreparedSnapshot
+		effectiveParent = parent
+		parentUpperdir  string
+	)
 	defer func() {
 		if err != nil {
+			if prepared != nil {
+				if err1 := prepared.Abort(ctx); err1 != nil {
+					log.G(ctx).WithError(err1).Warn("failed to abort devbox snapshot preparation")
+				}
+			}
 			if td != "" {
 				if err1 := o.cleanupSnapshotDirectory(ctx, td); err1 != nil {
 					log.G(ctx).WithError(err1).Warn("failed to cleanup temp snapshot directory")
@@ -530,12 +586,51 @@ func (o *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 	}()
 
 	snapshotDir := filepath.Join(o.root, "snapshots")
-	td, err = o.prepareDirectory(ctx, snapshotDir, kind)
-	if err != nil {
-		if rerr := t.Rollback(); rerr != nil {
-			log.G(ctx).WithError(rerr).Warn("failed to rollback transaction")
+	base := snapshots.Info{}
+	for _, opt := range opts {
+		if err := opt(&base); err != nil {
+			if rerr := t.Rollback(); rerr != nil {
+				log.G(ctx).WithError(rerr).Warn("failed to rollback transaction")
+			}
+			return storage.Snapshot{}, fmt.Errorf("failed to apply snapshot options: %w", err)
 		}
-		return storage.Snapshot{}, fmt.Errorf("failed to create prepare snapshot dir: %w", err)
+	}
+	if o.devbox != nil && kind == snapshots.KindActive && o.devbox.Handles(base.Labels) {
+		if _, ok := base.Labels[devbox.PrivateImageLabel]; ok && parent != "" {
+			parentID, pInfo, _, err := storage.GetInfo(ctx, parent)
+			if err != nil {
+				if rerr := t.Rollback(); rerr != nil {
+					log.G(ctx).WithError(rerr).Warn("failed to rollback transaction")
+				}
+				return storage.Snapshot{}, fmt.Errorf("failed to resolve devbox private image parent: %w", err)
+			}
+			effectiveParent = pInfo.Parent
+			parentUpperdir = o.upperPath(parentID)
+		}
+		prepared, _, err = o.devbox.Prepare(ctx, devbox.PrepareRequest{
+			SnapshotDir:    snapshotDir,
+			Key:            key,
+			Kind:           kind,
+			Labels:         base.Labels,
+			ParentUpperdir: parentUpperdir,
+		})
+		if err != nil {
+			if rerr := t.Rollback(); rerr != nil {
+				log.G(ctx).WithError(rerr).Warn("failed to rollback transaction")
+			}
+			return storage.Snapshot{}, fmt.Errorf("failed to prepare devbox snapshot: %w", err)
+		}
+	}
+	if prepared != nil {
+		td = prepared.TempDir
+	} else {
+		td, err = o.prepareDirectory(ctx, snapshotDir, kind)
+		if err != nil {
+			if rerr := t.Rollback(); rerr != nil {
+				log.G(ctx).WithError(rerr).Warn("failed to rollback transaction")
+			}
+			return storage.Snapshot{}, fmt.Errorf("failed to create prepare snapshot dir: %w", err)
+		}
 	}
 	rollback := true
 	defer func() {
@@ -546,7 +641,7 @@ func (o *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 		}
 	}()
 
-	s, err := storage.CreateSnapshot(ctx, kind, key, parent, opts...)
+	s, err := storage.CreateSnapshot(ctx, kind, key, effectiveParent, opts...)
 	if err != nil {
 		return storage.Snapshot{}, fmt.Errorf("failed to create snapshot: %w", err)
 	}
@@ -568,14 +663,29 @@ func (o *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 	}
 
 	path = filepath.Join(snapshotDir, s.ID)
-	if err = os.Rename(td, path); err != nil {
-		return storage.Snapshot{}, fmt.Errorf("failed to rename: %w", err)
+	if prepared != nil {
+		if err = prepared.Finalize(ctx, path); err != nil {
+			return storage.Snapshot{}, fmt.Errorf("failed to finalize devbox snapshot: %w", err)
+		}
+		td = ""
+	} else {
+		if err = os.Rename(td, path); err != nil {
+			return storage.Snapshot{}, fmt.Errorf("failed to rename: %w", err)
+		}
+		td = ""
 	}
-	td = ""
 
 	rollback = false
 	if err = t.Commit(); err != nil {
 		return storage.Snapshot{}, fmt.Errorf("commit failed: %w", err)
+	}
+	if prepared != nil {
+		if err = prepared.Register(ctx, key, s.ID, path); err != nil {
+			if rerr := o.removeSnapshotMetadata(ctx, key); rerr != nil {
+				log.G(ctx).WithError(rerr).WithField("key", key).Warn("failed to rollback snapshot metadata after devbox registration failure")
+			}
+			return storage.Snapshot{}, fmt.Errorf("failed to register devbox snapshot: %w", err)
+		}
 	}
 
 	return s, nil
@@ -680,8 +790,32 @@ func (o *snapshotter) Close() error {
 	if err := o.cleanup(ctx, cleanupCommitted); err != nil {
 		log.G(ctx).WithError(err).Warn("failed to cleanup")
 	}
+	if o.devbox != nil {
+		if err := o.devbox.Cleanup(ctx); err != nil {
+			log.G(ctx).WithError(err).Warn("failed to cleanup devbox volumes")
+		}
+	}
+	if o.devbox != nil {
+		if err := o.devbox.Close(); err != nil {
+			log.G(ctx).WithError(err).Warn("failed to close devbox controller")
+		}
+	}
 
 	return o.ms.Close()
+}
+
+func (o *snapshotter) removeSnapshotMetadata(ctx context.Context, key string) error {
+	ctx, t, err := o.ms.TransactionContext(ctx, true)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = t.Rollback()
+	}()
+	if _, _, err := storage.Remove(ctx, key); err != nil && !errdefs.IsNotFound(err) {
+		return err
+	}
+	return t.Commit()
 }
 
 // prepareRemoteSnapshot tries to prepare the snapshot as a remote snapshot
@@ -754,7 +888,7 @@ func (o *snapshotter) restoreRemoteSnapshot(ctx context.Context) error {
 		return err
 	}
 	for _, m := range mounts {
-		if strings.HasPrefix(m.Mountpoint, filepath.Join(o.root, "snapshots")) {
+		if strings.HasPrefix(m.Mountpoint, filepath.Join(o.root, "snapshots")) && filepath.Base(m.Mountpoint) == "fs" {
 			if err := syscall.Unmount(m.Mountpoint, syscall.MNT_FORCE); err != nil {
 				return fmt.Errorf("failed to unmount %s: %w", m.Mountpoint, err)
 			}

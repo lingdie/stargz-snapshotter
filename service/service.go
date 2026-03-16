@@ -33,6 +33,7 @@ import (
 	esgzexternaltoc "github.com/containerd/stargz-snapshotter/nativeconverter/estargz/externaltoc"
 	"github.com/containerd/stargz-snapshotter/service/resolver"
 	"github.com/containerd/stargz-snapshotter/snapshot"
+	snapshotdevbox "github.com/containerd/stargz-snapshotter/snapshot/devbox"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
@@ -73,14 +74,28 @@ func NewStargzSnapshotterService(ctx context.Context, root string, config *Confi
 	}
 
 	var snapshotter snapshots.Snapshotter
+	var controller *snapshotdevbox.Controller
 
 	snOpts := []snapshot.Opt{snapshot.AsynchronousRemove}
 	if config.AllowInvalidMountsOnRestart {
 		snOpts = append(snOpts, snapshot.AllowInvalidMountsOnRestart)
 	}
+	if config.Devbox.Enable {
+		controller, err = snapshotdevbox.NewController(snapshotterRoot(root), snapshotdevbox.Config{
+			VolumeGroup:  config.Devbox.VolumeGroup,
+			ThinPoolName: config.Devbox.ThinPoolName,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to configure devbox controller: %w", err)
+		}
+		snOpts = append(snOpts, snapshot.WithDevboxController(controller))
+	}
 
 	snapshotter, err = snapshot.NewSnapshotter(ctx, snapshotterRoot(root), fs, snOpts...)
 	if err != nil {
+		if controller != nil {
+			_ = controller.Close()
+		}
 		return nil, fmt.Errorf("failed to create new snapshotter: %w", err)
 	}
 
