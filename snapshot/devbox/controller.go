@@ -484,6 +484,9 @@ func (c *Controller) listVolumes(ctx context.Context) ([]string, error) {
 	var names []string
 	for _, line := range strings.Split(string(out), "\n") {
 		name := strings.TrimSpace(line)
+		if name == "" || name == c.thinPoolName {
+			continue
+		}
 		if strings.HasPrefix(name, "devbox-") {
 			names = append(names, name)
 		}

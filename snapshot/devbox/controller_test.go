@@ -150,6 +150,36 @@ func TestParseLimit(t *testing.T) {
 	}
 }
 
+func TestCleanupSkipsThinPool(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	runner := newFakeRunner()
+	runner.sizes["devbox-thinpool"] = 1024
+	runner.sizes["devbox-content-1234"] = 1024
+
+	controller, err := NewController(root, Config{
+		VolumeGroup:  "testvg",
+		ThinPoolName: "devbox-thinpool",
+	}, WithRunner(runner))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+
+	if err := controller.Cleanup(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.removed) != 1 {
+		t.Fatalf("expected one removable LV, got %d", len(runner.removed))
+	}
+	if runner.removed[0] != "devbox-content-1234" {
+		t.Fatalf("unexpected removed LV %q", runner.removed[0])
+	}
+	if _, ok := runner.sizes["devbox-thinpool"]; !ok {
+		t.Fatal("thin pool should not be removed during cleanup")
+	}
+}
+
 type fakeRunner struct {
 	mu      sync.Mutex
 	sizes   map[string]int64

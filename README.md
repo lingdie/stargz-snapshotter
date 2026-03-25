@@ -46,6 +46,7 @@ Stargz Snapshotter is a **non-core** sub-project of containerd.
 ## Quick Start with Kubernetes
 
 - For more details about stargz snapshotter plugin and its configuration, refer to [Containerd Stargz Snapshotter Plugin Overview](/docs/overview.md).
+- For devbox writable layer support on top of stargz snapshotter, refer to [Devbox Writable Layer Guide](/docs/devbox.md).
 - For more details about setup lazy pulling of eStargz with containerd, CRI-O, Podman, systemd, etc., refer to [Install Stargz Snapshotter and Stargz Store](./docs/INSTALL.md).
 - For more details about integration status of eStargz with tools in community, refer to [Integration of eStargz with other tools](./docs/integration.md)
 

@@ -40,6 +40,7 @@ import (
 	"github.com/containerd/stargz-snapshotter/service"
 	"github.com/containerd/stargz-snapshotter/service/keychain/keychainconfig"
 	snbase "github.com/containerd/stargz-snapshotter/snapshot"
+	snapshotdevbox "github.com/containerd/stargz-snapshotter/snapshot/devbox"
 	"github.com/containerd/stargz-snapshotter/version"
 	sddaemon "github.com/coreos/go-systemd/v22/daemon"
 	metrics "github.com/docker/go-metrics"
@@ -190,6 +191,19 @@ func main() {
 			log.G(ctx).WithError(err).Fatalf("failed to configure fusemanager")
 		}
 		flags := []snbase.Opt{snbase.AsynchronousRemove}
+		if config.AllowInvalidMountsOnRestart {
+			flags = append(flags, snbase.AllowInvalidMountsOnRestart)
+		}
+		if config.Devbox.Enable {
+			controller, err := snapshotdevbox.NewController(filepath.Join(*rootDir, "snapshotter"), snapshotdevbox.Config{
+				VolumeGroup:  config.Devbox.VolumeGroup,
+				ThinPoolName: config.Devbox.ThinPoolName,
+			})
+			if err != nil {
+				log.G(ctx).WithError(err).Fatalf("failed to configure devbox controller")
+			}
+			flags = append(flags, snbase.WithDevboxController(controller))
+		}
 		// "managerNewlyStarted" being true indicates that the FUSE manager is newly started. To
 		// fully recover the snapshotter and the FUSE manager's state, we need to restore
 		// all snapshot mounts. If managerNewlyStarted is false, the existing FUSE manager maintains
