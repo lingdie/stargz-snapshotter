@@ -2,9 +2,23 @@
 
 # Enables CRI-based keychain
 # Stargz Snapshotter works as a proxy of CRI.
-# kubelet MUST listen stargz snapshotter's socket (unix:///run/containerd-stargz-grpc/containerd-stargz-grpc.sock)
+# kubelet MUST listen stargz snapshotter's CRI socket (unix:///run/containerd-stargz-grpc/cri.sock)
 # instead of containerd for image service.
-# i.e. add `--image-service-endpoint=unix:///run/containerd-stargz-grpc/containerd-stargz-grpc.sock` option to kubelet.
+# i.e. add `--image-service-endpoint=unix:///run/containerd-stargz-grpc/cri.sock` option to kubelet.
 [cri_keychain]
 enable_keychain = true
 image_service_path = "/run/containerd/containerd.sock"
+listen_path = "/run/containerd-stargz-grpc/cri.sock"
+
+[snapshotter]
+allow_invalid_mounts_on_restart = true
+
+[snapshotter.devbox]
+enable = true
+lvm_vg_name = "devbox-vg"
+thin_pool_name = "devbox-vg-thinpool"
+
+[fuse_manager]
+enable = true
+address = "/run/containerd-stargz-grpc/fuse-manager.sock"
+path = "/usr/local/bin/stargz-fuse-manager"

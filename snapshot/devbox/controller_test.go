@@ -130,6 +130,9 @@ func TestVolumeNameIsStableAndSafe(t *testing.T) {
 	if strings.ContainsAny(name1, "/:") {
 		t.Fatalf("unsafe volume name %q", name1)
 	}
+	if !strings.HasPrefix(name1, volumeNamePrefix) {
+		t.Fatalf("expected %q to have prefix %q", name1, volumeNamePrefix)
+	}
 }
 
 func TestParseLimit(t *testing.T) {
@@ -156,6 +159,7 @@ func TestCleanupSkipsThinPool(t *testing.T) {
 	runner := newFakeRunner()
 	runner.sizes["devbox-thinpool"] = 1024
 	runner.sizes["devbox-content-1234"] = 1024
+	runner.sizes["stargz-devbox-content-1234"] = 1024
 
 	controller, err := NewController(root, Config{
 		VolumeGroup:  "testvg",
@@ -172,11 +176,101 @@ func TestCleanupSkipsThinPool(t *testing.T) {
 	if len(runner.removed) != 1 {
 		t.Fatalf("expected one removable LV, got %d", len(runner.removed))
 	}
-	if runner.removed[0] != "devbox-content-1234" {
+	if runner.removed[0] != "stargz-devbox-content-1234" {
 		t.Fatalf("unexpected removed LV %q", runner.removed[0])
 	}
 	if _, ok := runner.sizes["devbox-thinpool"]; !ok {
 		t.Fatal("thin pool should not be removed during cleanup")
+	}
+	if _, ok := runner.sizes["devbox-content-1234"]; !ok {
+		t.Fatal("foreign devbox LV should not be removed during cleanup")
+	}
+}
+
+func TestPrepareRecreatesMissingLVFromStaleMetadata(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	snapshotDir := filepath.Join(root, "snapshots")
+	if err := os.MkdirAll(snapshotDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	mounts := newFakeMountTable()
+	runner := newFakeRunner()
+	controller, err := NewController(root, Config{VolumeGroup: "testvg"},
+		WithRunner(runner),
+		WithMountFunc(mounts.mount),
+		WithUnmountFunc(mounts.unmount),
+		WithMountInfoFunc(mounts.info),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+
+	contentID := "090a86d6-6585-4e7a-b4d4-2c274c060d01"
+	staleLV := "devbox-090a86d6-6585-4e7a-b4d4--9e383ebb"
+	if err := controller.store.Save(ctx,
+		SnapshotRecord{
+			Key:       "old-key",
+			ID:        "12",
+			ContentID: contentID,
+			LVName:    staleLV,
+			MountPath: filepath.Join(snapshotDir, "12"),
+		},
+		ContentRecord{
+			ContentID:   contentID,
+			LVName:      staleLV,
+			SnapshotKey: "old-key",
+			Status:      statusActive,
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	prepared, handled, err := controller.Prepare(ctx, PrepareRequest{
+		SnapshotDir: snapshotDir,
+		Key:         "active-key",
+		Kind:        snapshots.KindActive,
+		Labels: map[string]string{
+			ContentIDLabel:    contentID,
+			StorageLimitLabel: "1Gi",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !handled {
+		t.Fatal("expected prepare to be handled")
+	}
+
+	finalPath := filepath.Join(snapshotDir, "13")
+	if err := prepared.Finalize(ctx, finalPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepared.Register(ctx, "active-key", "13", finalPath); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := controller.store.Snapshot(ctx, "old-key"); !errdefs.IsNotFound(err) {
+		t.Fatalf("expected stale snapshot to be removed, got %v", err)
+	}
+
+	content, err := controller.store.Content(ctx, contentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if content.SnapshotKey != "active-key" {
+		t.Fatalf("expected snapshot key to be rebound, got %q", content.SnapshotKey)
+	}
+	if content.LVName == staleLV {
+		t.Fatalf("expected stale LV %q to be replaced", staleLV)
+	}
+	if !strings.HasPrefix(content.LVName, volumeNamePrefix) {
+		t.Fatalf("expected replacement LV %q to use prefix %q", content.LVName, volumeNamePrefix)
+	}
+	if _, ok := runner.sizes[content.LVName]; !ok {
+		t.Fatalf("expected replacement LV %q to be created", content.LVName)
 	}
 }
 
@@ -229,6 +323,14 @@ func (r *fakeRunner) CombinedOutput(ctx context.Context, name string, args ...st
 			return []byte(fmt.Sprintf("%d\n", r.sizes[lvName])), nil
 		}
 		if contains(args, "lv_name") {
+			lastArg := args[len(args)-1]
+			if strings.HasPrefix(lastArg, "/dev/") {
+				lvName := filepath.Base(lastArg)
+				if _, ok := r.sizes[lvName]; !ok {
+					return []byte(""), fmt.Errorf("Failed to find logical volume %q", strings.TrimPrefix(lastArg, "/dev/"))
+				}
+				return []byte(lvName + "\n"), nil
+			}
 			var out []string
 			for lvName := range r.sizes {
 				out = append(out, lvName)

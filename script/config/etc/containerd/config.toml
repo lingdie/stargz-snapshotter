@@ -1,23 +1,27 @@
 # See also: https://github.com/kubernetes-sigs/kind/blob/fd64a56b0c3d5654eb6d22bce812e2a87eac5853/images/base/files/etc/containerd/config.toml
+# Devbox dual-snapshotter example:
+# - runtime handler "devbox-runc"         -> snapshotter "devbox"
+# - runtime handler "devbox-stargz-runc"  -> snapshotter "stargz"
 
 # explicitly use v2 config format
 version = 2
 
-# - Set default runtime handler to v2, which has a per-pod shim
-# - Enable to use stargz snapshotter
 [plugins."io.containerd.grpc.v1.cri".containerd]
   default_runtime_name = "runc"
-  snapshotter = "stargz"
+  snapshotter = "overlayfs"
   disable_snapshot_annotations = false
+
 [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
   runtime_type = "io.containerd.runc.v2"
 
-# Setup a runtime with the magic name ("test-handler") used for Kubernetes
-# runtime class tests ...
-[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.test-handler]
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.devbox-runc]
   runtime_type = "io.containerd.runc.v2"
+  snapshotter = "devbox"
 
-# Use stargz snapshotter
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.devbox-stargz-runc]
+  runtime_type = "io.containerd.runc.v2"
+  snapshotter = "stargz"
+
 [proxy_plugins]
   [proxy_plugins.stargz]
     type = "snapshot"

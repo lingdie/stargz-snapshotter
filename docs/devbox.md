@@ -18,12 +18,22 @@
 - 已安装 `mkfs.ext4`
 - 已存在可用的 volume group
 - 如果使用 thin provisioning，还需要已有 thin pool
-- containerd 侧已启用 `stargz` snapshotter，并设置：
+- containerd 侧需要同时具备 `devbox` 与 `stargz` snapshotter 能力，并允许 snapshot annotations 透传
+
+推荐（双 RuntimeClass）配置如下：
 
 ```toml
 [plugins."io.containerd.grpc.v1.cri".containerd]
-  snapshotter = "stargz"
+  snapshotter = "overlayfs"
   disable_snapshot_annotations = false
+
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.devbox-runc]
+  runtime_type = "io.containerd.runc.v2"
+  snapshotter = "devbox"
+
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.devbox-stargz-runc]
+  runtime_type = "io.containerd.runc.v2"
+  snapshotter = "stargz"
 ```
 
 `disable_snapshot_annotations = false` 很重要；否则上层写入的 snapshot labels 不会透传。
@@ -69,6 +79,11 @@ cp script/config/etc/systemd/system/stargz-snapshotter.service /etc/systemd/syst
 [snapshotter]
 allow_invalid_mounts_on_restart = true
 
+[cri_keychain]
+enable_keychain = true
+image_service_path = "/run/containerd/containerd.sock"
+listen_path = "/run/containerd-stargz-grpc/cri.sock"
+
 [snapshotter.devbox]
 enable = true
 lvm_vg_name = "devbox-lvm-vg"
@@ -90,6 +105,12 @@ address = "/run/containerd-stargz-grpc/fuse-manager.sock"
 path = "/usr/local/bin/stargz-fuse-manager"
 ```
 
+如果启用了 `cri_keychain` + `fuse_manager`，`listen_path` 必须显式配置，且 kubelet 需要改为：
+
+```bash
+--image-service-endpoint=unix:///run/containerd-stargz-grpc/cri.sock
+```
+
 ## 5. 配置 containerd
 
 确保 `/etc/containerd/config.toml` 包含：
@@ -105,9 +126,60 @@ version = 2
     root = "/var/lib/containerd-stargz-grpc/"
 
 [plugins."io.containerd.grpc.v1.cri".containerd]
-  snapshotter = "stargz"
+  snapshotter = "overlayfs"
   disable_snapshot_annotations = false
+
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.devbox-runc]
+  runtime_type = "io.containerd.runc.v2"
+  snapshotter = "devbox"
+
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.devbox-stargz-runc]
+  runtime_type = "io.containerd.runc.v2"
+  snapshotter = "stargz"
 ```
+
+如果你的 `devbox` snapshotter 是内置插件（`io.containerd.snapshotter.v1.devbox`），需要额外在 containerd 配置中启用对应插件段（示例）：
+
+```toml
+[plugins."io.containerd.snapshotter.v1.devbox"]
+  root_path = "/var/lib/containerd/io.containerd.snapshotter.v1.devbox"
+  upperdir_label = true
+  sync_remove = true
+  lvm_vg_name = "devbox-vg"
+  thin_pool_name = "devbox-vg-thinpool"
+```
+
+### 5.1 RuntimeClass 对应关系（关键）
+
+- `RuntimeClass: devbox-runc` -> containerd runtime handler `devbox-runc` -> snapshotter `devbox`
+- `RuntimeClass: devbox-stargz-runc` -> containerd runtime handler `devbox-stargz-runc` -> snapshotter `stargz`
+
+建议在集群显式创建两个 RuntimeClass：
+
+```yaml
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: devbox-runc
+handler: devbox-runc
+---
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: devbox-stargz-runc
+handler: devbox-stargz-runc
+```
+
+### 5.2 Controller 挂载与环境变量要求
+
+对于双 snapshotter 场景，controller 不需要新增专用环境变量，但必须能访问以下宿主机目录：
+
+- `/run/containerd`
+- `/var/run/containerd`
+- `/var/lib/containerd`（覆盖 `devbox` snapshotter 数据目录）
+- `/var/lib/containerd-stargz-grpc`（覆盖 `stargz` snapshotter 数据目录）
+
+如果部署模板已包含上述挂载，则无需额外调整。
 
 ## 6. 启动
 
@@ -178,6 +250,20 @@ systemctl restart containerd
 
 如果你已经有自己的 containerd client、CRI 扩展或者调度层，只需要在 `Prepare` 前写入这些 labels。
 
+在 Kubernetes 侧，按需指定 `runtimeClassName`：
+
+```yaml
+# 使用本地 devbox snapshotter
+spec:
+  runtimeClassName: devbox-runc
+```
+
+```yaml
+# 使用 stargz snapshotter
+spec:
+  runtimeClassName: devbox-stargz-runc
+```
+
 ## 9. 一个典型生命周期
 
 1. 上层请求创建 active snapshot，并传入：
@@ -216,10 +302,47 @@ mount | grep /var/lib/containerd-stargz-grpc/snapshotter/snapshots
 ### 检查 stargz socket
 
 ```bash
+# containerd 代理 stargz snapshotter 的 socket
 ls -l /run/containerd-stargz-grpc/containerd-stargz-grpc.sock
+
+# kubelet 使用的 CRI socket（启用 cri_keychain + fuse_manager 时）
+ls -l /run/containerd-stargz-grpc/cri.sock
 ```
 
 ## 11. 故障排查
+
+### RuntimeClass 与 snapshotter 映射是否生效
+
+```bash
+# 检查 RuntimeClass 是否存在
+kubectl get runtimeclass
+
+# 检查 containerd runtime handler 的 snapshotter 映射
+grep -nE 'runtimes\\.devbox-runc|runtimes\\.devbox-stargz-runc|snapshotter\\s*=' /etc/containerd/config.toml
+
+# 查看 pod 实际 runtimeClassName
+kubectl get pod -A -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,RUNTIMECLASS:.spec.runtimeClassName'
+```
+
+预期：
+
+- 业务使用 `runtimeClassName: devbox-runc` 时应命中 `snapshotter = "devbox"`
+- 业务使用 `runtimeClassName: devbox-stargz-runc` 时应命中 `snapshotter = "stargz"`
+
+### 使用一键诊断脚本
+
+仓库提供了诊断脚本：
+
+```bash
+bash script/diagnose-devbox-runtimeclass.sh
+```
+
+脚本会检查：
+
+- `containerd` 与 `stargz-snapshotter` 服务状态
+- RuntimeClass 资源是否下发
+- containerd runtime handler 到 snapshotter 的映射
+- 关键 socket、挂载路径与 LVM 基本状态
 
 ### `lvcreate` / `lvresize` 失败
 
@@ -251,6 +374,8 @@ ls -l /run/containerd-stargz-grpc/containerd-stargz-grpc.sock
 
 - `script/devbox/staging/push-stargz-bundle.sh`
 - `script/devbox/staging/remote-install.sh`
+
+如果当前分支没有这两个脚本，请按前面章节手工拷贝 `script/config` 下模板并执行安装命令。
 
 这两个脚本职责如下：
 
@@ -298,7 +423,7 @@ bash script/devbox/staging/push-stargz-bundle.sh
     stargz-fuse-manager
   config/etc/containerd-stargz-grpc/config.toml
   config/etc/systemd/system/stargz-snapshotter.service
-  config/etc/containerd/config.toml.example
+  config/etc/containerd/config.toml
   scripts/remote-install.sh
 ```
 

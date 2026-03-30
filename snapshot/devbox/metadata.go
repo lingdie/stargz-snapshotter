@@ -211,6 +211,46 @@ func (s *metadataStore) ClearContentSnapshot(ctx context.Context, contentID, sna
 	})
 }
 
+func (s *metadataStore) ForgetContent(ctx context.Context, contentID string) error {
+	_ = ctx
+	return s.update(func(tx *bolt.Tx) error {
+		snapshots := tx.Bucket(snapshotsBucket)
+		if snapshots == nil {
+			return fmt.Errorf("devbox snapshots bucket missing: %w", errdefs.ErrNotFound)
+		}
+		content := tx.Bucket(contentBucket)
+		if content == nil {
+			return fmt.Errorf("devbox content bucket missing: %w", errdefs.ErrNotFound)
+		}
+
+		var snapshotKeys [][]byte
+		if err := snapshots.ForEach(func(key, value []byte) error {
+			if value == nil {
+				return nil
+			}
+			var record SnapshotRecord
+			if err := json.Unmarshal(value, &record); err != nil {
+				return err
+			}
+			if record.ContentID != contentID {
+				return nil
+			}
+			copiedKey := make([]byte, len(key))
+			copy(copiedKey, key)
+			snapshotKeys = append(snapshotKeys, copiedKey)
+			return nil
+		}); err != nil {
+			return err
+		}
+		for _, key := range snapshotKeys {
+			if err := snapshots.Delete(key); err != nil {
+				return err
+			}
+		}
+		return content.Delete([]byte(contentID))
+	})
+}
+
 func (s *metadataStore) RemoveSnapshot(ctx context.Context, key string) error {
 	_ = ctx
 	return s.update(func(tx *bolt.Tx) error {

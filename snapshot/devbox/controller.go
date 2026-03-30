@@ -21,6 +21,8 @@ import (
 
 const DefaultVolumeGroup = "devbox-lvm-vg"
 
+const volumeNamePrefix = "stargz-devbox-"
+
 type Config struct {
 	VolumeGroup  string
 	ThinPoolName string
@@ -171,15 +173,29 @@ func (c *Controller) Prepare(ctx context.Context, req PrepareRequest) (*Prepared
 			_ = os.RemoveAll(state.tempDir)
 			return nil, true, fmt.Errorf("devbox content %q is already scheduled for removal", contentID)
 		}
-		if content.SnapshotKey != "" && content.SnapshotKey != req.Key {
-			_ = os.RemoveAll(state.tempDir)
-			return nil, true, fmt.Errorf("devbox content %q is already attached to snapshot %q", contentID, content.SnapshotKey)
-		}
 		if content.LVName == "" {
 			_ = os.RemoveAll(state.tempDir)
 			return nil, true, fmt.Errorf("devbox content %q has no logical volume recorded", contentID)
 		}
-		state.lvName = content.LVName
+		exists, err := c.volumeExists(ctx, content.LVName)
+		if err != nil {
+			_ = os.RemoveAll(state.tempDir)
+			return nil, true, err
+		}
+		if !exists {
+			if err := c.store.ForgetContent(ctx, contentID); err != nil {
+				_ = os.RemoveAll(state.tempDir)
+				return nil, true, err
+			}
+			state.lvName = volumeName(contentID)
+			state.newVolume = true
+		} else {
+			if content.SnapshotKey != "" && content.SnapshotKey != req.Key {
+				_ = os.RemoveAll(state.tempDir)
+				return nil, true, fmt.Errorf("devbox content %q is already attached to snapshot %q", contentID, content.SnapshotKey)
+			}
+			state.lvName = content.LVName
+		}
 	} else if !errdefs.IsNotFound(err) {
 		_ = os.RemoveAll(state.tempDir)
 		return nil, true, err
@@ -440,6 +456,17 @@ func (c *Controller) volumeSize(ctx context.Context, lvName string) (int64, erro
 	return strconv.ParseInt(strings.Fields(trimmed)[0], 10, 64)
 }
 
+func (c *Controller) volumeExists(ctx context.Context, lvName string) (bool, error) {
+	out, err := c.run(ctx, "lvs", "--noheadings", "-o", "lv_name", c.devicePath(lvName))
+	if err != nil {
+		if strings.Contains(err.Error(), "Failed to find logical volume") {
+			return false, nil
+		}
+		return false, err
+	}
+	return strings.TrimSpace(string(out)) != "", nil
+}
+
 func (c *Controller) makeFilesystem(ctx context.Context, lvName string) error {
 	_, err := c.run(ctx, "mkfs.ext4", "-F", c.devicePath(lvName))
 	return err
@@ -487,7 +514,7 @@ func (c *Controller) listVolumes(ctx context.Context) ([]string, error) {
 		if name == "" || name == c.thinPoolName {
 			continue
 		}
-		if strings.HasPrefix(name, "devbox-") {
+		if strings.HasPrefix(name, volumeNamePrefix) {
 			names = append(names, name)
 		}
 	}
@@ -637,7 +664,7 @@ func volumeName(contentID string) string {
 	if len(prefix) > 24 {
 		prefix = prefix[:24]
 	}
-	return fmt.Sprintf("devbox-%s-%s", prefix, hex.EncodeToString(sum[:4]))
+	return fmt.Sprintf("%s%s-%s", volumeNamePrefix, prefix, hex.EncodeToString(sum[:4]))
 }
 
 func sameDevice(left, right string) bool {
