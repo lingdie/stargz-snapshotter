@@ -414,15 +414,15 @@ func (o *snapshotter) Remove(ctx context.Context, key string) (err error) {
 			log.G(ctx).WithError(err).WithField("key", key).Warn("failed to update devbox snapshot metadata during remove")
 		}
 	}
+	if o.devbox != nil {
+		if err := o.devbox.Cleanup(ctx); err != nil {
+			log.G(ctx).WithError(err).Warn("failed to cleanup devbox volumes")
+		}
+	}
 	if !o.asyncRemove {
 		for _, dir := range removals {
 			if err := o.cleanupSnapshotDirectory(ctx, dir); err != nil {
 				log.G(ctx).WithError(err).WithField("path", dir).Warn("failed to remove directory")
-			}
-		}
-		if o.devbox != nil {
-			if err := o.devbox.Cleanup(ctx); err != nil {
-				log.G(ctx).WithError(err).Warn("failed to cleanup devbox volumes")
 			}
 		}
 	}

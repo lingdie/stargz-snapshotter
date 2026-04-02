@@ -274,14 +274,46 @@ func TestPrepareRecreatesMissingLVFromStaleMetadata(t *testing.T) {
 	}
 }
 
+func TestCleanupContinuesWhenSingleLVRemovalFails(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	runner := newFakeRunner()
+	runner.sizes["stargz-devbox-first"] = 1024
+	runner.sizes["stargz-devbox-second"] = 1024
+	runner.removeErrors["stargz-devbox-first"] = fmt.Errorf("lv busy")
+
+	controller, err := NewController(root, Config{
+		VolumeGroup:  "testvg",
+		ThinPoolName: "devbox-thinpool",
+	}, WithRunner(runner))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+
+	if err := controller.Cleanup(ctx); err != nil {
+		t.Fatalf("cleanup should continue on per-LV failure, got %v", err)
+	}
+	if len(runner.removed) != 1 || runner.removed[0] != "stargz-devbox-second" {
+		t.Fatalf("expected only second LV to be removed successfully, got %v", runner.removed)
+	}
+	if _, ok := runner.sizes["stargz-devbox-first"]; !ok {
+		t.Fatal("failed LV should remain for next cleanup")
+	}
+}
+
 type fakeRunner struct {
-	mu      sync.Mutex
-	sizes   map[string]int64
-	removed []string
+	mu           sync.Mutex
+	sizes        map[string]int64
+	removed      []string
+	removeErrors map[string]error
 }
 
 func newFakeRunner() *fakeRunner {
-	return &fakeRunner{sizes: make(map[string]int64)}
+	return &fakeRunner{
+		sizes:        make(map[string]int64),
+		removeErrors: make(map[string]error),
+	}
 }
 
 func (r *fakeRunner) CombinedOutput(ctx context.Context, name string, args ...string) ([]byte, error) {
@@ -339,6 +371,9 @@ func (r *fakeRunner) CombinedOutput(ctx context.Context, name string, args ...st
 		}
 	case "lvremove":
 		lvName := filepath.Base(args[len(args)-1])
+		if err := r.removeErrors[lvName]; err != nil {
+			return nil, err
+		}
 		delete(r.sizes, lvName)
 		r.removed = append(r.removed, lvName)
 		return nil, nil

@@ -324,15 +324,15 @@ func (c *Controller) Cleanup(ctx context.Context) error {
 		}
 		mounts, err := c.mountTargetsForDevice(ctx, c.devicePath(lvName))
 		if err != nil {
-			return err
+			continue
 		}
 		for _, target := range mounts {
 			if err := c.unmountIfMounted(target); err != nil {
-				return err
+				continue
 			}
 		}
 		if err := c.removeVolume(ctx, lvName); err != nil {
-			return err
+			continue
 		}
 	}
 	return nil
